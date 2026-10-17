@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ocean — WebGPU</title>
+<title>Leeward</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
@@ -23,7 +23,8 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <div id="fps">starting…</div>
-  <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · H panel</div>
+  <div id="boat">click the water to sail</div>
+  <div class="help">click water: sail there · arrows orbit and dolly · shift faster · wheel zoom · H panel</div>
 </div>
 <div id="panel" class="hidden"></div>
 <div id="err"></div>
@@ -1550,11 +1551,565 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
 }
 `;
 
+// ---- js/wgsl/objects.js ----
+// Sailboat and the click waypoint. The hull is rigid in the boat basis uploaded
+// from JS (boatAxes). The waypoint ring is planted on the displaced surface.
+
+const DISP_FN = /* wgsl */ `
+fn dispAt(xz: vec2f) -> vec3f {
+  var d = vec3f(0.0);
+  for (var c = 0u; c < ${CASCADES}u; c++) {
+    d += textureSampleLevel(dispTex, sampR, xz * F.cascInvL[c >> 2u][c & 3u], c, 0.0).xyz;
+  }
+  return d;
+}
+`;
+
+const OBJECTS = FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var transLUT: texture_2d<f32>;
+@group(0) @binding(2) var envCube: texture_cube<f32>;
+@group(0) @binding(3) var sampC: sampler;
+@group(0) @binding(4) var dispTex: texture_2d_array<f32>;
+@group(0) @binding(5) var sampR: sampler;
+@group(0) @binding(6) var<uniform> O: Obj;
+
+struct Obj {
+  axX: vec4f,     // world image of local +X (starboard)
+  axY: vec4f,
+  axZ: vec4f,     // world image of local +Z (astern). The bow is -axZ.
+  pos: vec4f,     // waterline origin, world metres
+  marker: vec4f,  // xy = world xz, z = radius, w unused
+};
+
+struct VO {
+  @builtin(position) pos: vec4f,
+  @location(0) rel: vec3f,
+  @location(1) nrm: vec3f,
+  @location(2) col: vec3f,
+  @location(3) kind: f32,  // 0 hull, 1 sail, 2 marker
+};
+
+` + DISP_FN + /* wgsl */ `
+@vertex fn vs(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) col: vec4f) -> VO {
+  var world: vec3f;
+  var nrm: vec3f;
+  var kind = 0.0;
+  if (col.w > 2.5) {
+    let goal = O.marker.xy + p.xz * O.marker.z;
+    var x0 = goal;
+    for (var i = 0; i < 3; i++) { x0 = goal - dispAt(x0).xz; }
+    let d = dispAt(x0);
+    world = vec3f(goal.x, d.y + 0.28, goal.y);
+    nrm = vec3f(0.0, 1.0, 0.0);
+    kind = 2.0;
+  } else {
+    var lp = p;
+    if (col.w > 0.5) {
+      // Sail cloth pushes to leeward. Wind vector matches the wave spectrum.
+      let wind = vec3f(F.windP[0].x, 0.0, F.windP[0].y);
+      let lee = dot(wind, O.axX.xyz);
+      let billow = col.w - 1.0;
+      let flutter = 0.06 * sin(F.camPos.w * 1.5 + p.y * 0.31);
+      lp.x += billow * (lee * 0.55 + flutter);
+      kind = 1.0;
+    }
+    world = O.pos.xyz + O.axX.xyz * lp.x + O.axY.xyz * lp.y + O.axZ.xyz * lp.z;
+    nrm = O.axX.xyz * n.x + O.axY.xyz * n.y + O.axZ.xyz * n.z;
+  }
+  var o: VO;
+  o.rel = world - F.camPos.xyz;
+  o.pos = F.viewProj * vec4f(o.rel, 1.0);
+  o.nrm = nrm;
+  o.col = col.rgb;
+  o.kind = kind;
+  return o;
+}
+
+@fragment fn fs(in: VO) -> @location(0) vec4f {
+  let dist = length(in.rel);
+  let V = -in.rel / max(dist, 1e-4);          // toward the camera
+  let N = normalize(in.nrm);
+  let Ld = F.sunDir.xyz;
+  let sunE = textureSampleLevel(transLUT, sampC, transRMuToUV(RG + F.atmo.y, Ld.y), 0.0).rgb * F.sunDir.w;
+  if (in.kind > 1.5) {
+    let mark = in.col * (0.85 + dot(sunE, vec3f(0.02)));
+    return vec4f(mark, 1.0);
+  }
+  let amb = textureSampleLevel(envCube, sampC, N, 5.0).rgb;
+  let ndl = clamp(dot(N, Ld) * 0.65 + 0.35, 0.0, 1.0);
+  var col = in.col * (amb * 0.95 + sunE * ndl * 0.18);
+  let R = reflect(-V, N);
+  let rough = select(1.6, 4.2, in.kind > 0.5);
+  let spec = textureSampleLevel(envCube, sampC, R, rough).rgb;
+  let fres = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 4.0);
+  col += spec * fres * select(0.28, 0.06, in.kind > 0.5);
+  // Sails pass a little sunset light when seen from behind.
+  if (in.kind > 0.5) {
+    col += in.col * sunE * clamp(-dot(N, Ld), 0.0, 1.0) * 0.07;
+  }
+  let viewDir = -V;
+  let T = exp(-max(F.fogExt.rgb, vec3f(F.fogExt.w)) * dist);
+  let fogDir = normalize(vec3f(viewDir.x, 0.02, viewDir.z));
+  let fogCol = textureSampleLevel(envCube, sampC, fogDir, 1.0).rgb;
+  col = col * T + fogCol * (1.0 - T);
+  return vec4f(col, 1.0);
+}
+`;
+
+// Five wave heights: center, bow, stern, port, starboard. Same inversion as the camera probe.
+const BOAT_PROBE = FRAME_WGSL + /* wgsl */ `
+struct ProbeIn { p: array<vec4f, 5> };
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var dispTex: texture_2d_array<f32>;
+@group(0) @binding(2) var sampR: sampler;
+@group(0) @binding(3) var<uniform> pin: ProbeIn;
+@group(0) @binding(4) var<storage, read_write> outH: array<f32, 8>;
+` + DISP_FN + /* wgsl */ `
+@compute @workgroup_size(1)
+fn main() {
+  for (var i = 0u; i < 5u; i++) {
+    let goal = pin.p[i].xz;
+    var x0 = goal;
+    for (var k = 0; k < 4; k++) {
+      x0 = goal - dispAt(x0).xz;
+    }
+    outH[i] = dispAt(x0).y;
+  }
+}
+`;
+
+// ---- js/boat.js ----
+// Sailboat motion, camera basis, and the procedural hull.
+//
+// One heading frame, shared with the camera in main.js:
+//   yaw 0 looks down world -Z, positive yaw turns toward +X.
+//   forward = (sin yaw, 0, -cos yaw)
+//   right    = (-forward.z, 0, forward.x) = (cos yaw, 0, sin yaw)
+// The mesh bow is local -Z. boatAxes() is the only place that turns a yaw into
+// the basis the shader multiplies. Positive pitch raises the bow. Positive roll
+// raises the starboard side (local +X).
+
+const TAU = Math.PI * 2;
+
+function cameraAxes(yaw, pitch, o) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  o.fx = cp * sy; o.fy = sp; o.fz = -cp * cy;
+  o.rx = cy; o.ry = 0; o.rz = sy;
+  // view up = right × forward
+  o.ux = o.ry * o.fz - o.rz * o.fy;
+  o.uy = o.rz * o.fx - o.rx * o.fz;
+  o.uz = o.rx * o.fy - o.ry * o.fx;
+}
+
+function headingXZ(yaw, o) {
+  o.fx = Math.sin(yaw);
+  o.fz = -Math.cos(yaw);
+  o.rx = -o.fz;
+  o.rz = o.fx;
+}
+
+// Local +X, +Y, +Z as 9 floats. Local +Z is astern, so the bow (local -Z) points along forward.
+function boatAxes(yaw, pitch, roll, o) {
+  const fx = Math.sin(yaw), fz = -Math.cos(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const ffx = fx * cp, ffy = sp, ffz = fz * cp;
+  const rx = -fz, rz = fx;
+  const ux = -rz * ffy;
+  const uy = rz * ffx - rx * ffz;
+  const uz = rx * ffy;
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  o[0] = rx * cr + ux * sr;
+  o[1] = uy * sr;
+  o[2] = rz * cr + uz * sr;
+  o[3] = ux * cr - rx * sr;
+  o[4] = uy * cr;
+  o[5] = uz * cr - rz * sr;
+  o[6] = -ffx;
+  o[7] = -ffy;
+  o[8] = -ffz;
+}
+
+// Wave samples are heights at bow, stern, port, starboard. Wind XZ is the
+// direction the wind blows toward, the same vector the spectrum uses.
+const seaHdg = { fx: 0, fz: 0, rx: 0, rz: 0 };
+function seaPose(bowH, sternH, portH, starH, windX, windZ, yaw, length, beam, out) {
+  headingXZ(yaw, seaHdg);
+  out.pitch = Math.atan2(bowH - sternH, length);
+  const lateral = windX * seaHdg.rx + windZ * seaHdg.rz;
+  // Wind blowing toward starboard heels the boat onto that side.
+  out.roll = Math.atan2(starH - portH, beam) - lateral * 0.22;
+}
+
+function windVector(deg, out) {
+  const r = deg * Math.PI / 180;
+  out.x = Math.cos(r);
+  out.z = Math.sin(r);
+}
+
+// Click ray against the mean sea (y = 0). ndcX/ndcY are -1..1, y up.
+// aspect is the projection aspect (render width / height), matching writeFrame.
+function waterHit(cam, ndcX, ndcY, aspect) {
+  const a = { fx: 0, fy: 0, fz: 0, rx: 0, ry: 0, rz: 0, ux: 0, uy: 0, uz: 0 };
+  cameraAxes(cam.yaw, cam.pitch, a);
+  const tanY = Math.tan(cam.fovY * 0.5);
+  const tanX = tanY * aspect;
+  let dx = a.fx + ndcX * a.rx * tanX + ndcY * a.ux * tanY;
+  let dy = a.fy + ndcX * a.ry * tanX + ndcY * a.uy * tanY;
+  let dz = a.fz + ndcX * a.rz * tanX + ndcY * a.uz * tanY;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  dx /= len; dy /= len; dz /= len;
+  if (dy >= -0.02) return null;
+  const t = -cam.y / dy;
+  if (!(t > 0) || t > 2000) return null;
+  return { x: cam.x + dx * t, z: cam.z + dz * t };
+}
+
+// Yaw that looks from the origin toward (dx, dz), in the same frame as headingXZ.
+function yawToward(dx, dz) {
+  return Math.atan2(dx, -dz);
+}
+
+// Yaw and pitch that look along (dx, dy, dz). Pitch is negative when looking down.
+function lookYawPitch(dx, dy, dz, out) {
+  out.yaw = yawToward(dx, dz);
+  out.pitch = Math.atan2(dy, Math.hypot(dx, dz) || 1e-6);
+}
+
+const chaseHdg = { fx: 0, fz: 0, rx: 0, rz: 0 };
+
+// Camera position for a chase rig. orbit 0 is directly astern. Positive orbit
+// swings the camera to its own right. out receives x and z; y is left alone.
+function chasePosition(boatX, boatZ, boatYaw, orbit, distance, out) {
+  headingXZ(boatYaw - orbit, chaseHdg);
+  out.x = boatX - chaseHdg.fx * distance;
+  out.z = boatZ - chaseHdg.fz * distance;
+}
+
+const stepHdg = { fx: 0, fz: 0, rx: 0, rz: 0 };
+const TURN_RATE = 0.65; // rad/s
+const ARRIVE = 2.4;
+
+// Sail toward boat.tx/tz. Speed falls off upwind but never stalls completely,
+// and is capped by the turn radius so the boat reaches the point instead of orbiting it.
+function stepBoat(boat, dt, windX, windZ) {
+  if (!boat.hasTarget) return 0;
+  const dx = boat.tx - boat.x;
+  const dz = boat.tz - boat.z;
+  const dist = Math.hypot(dx, dz);
+  let err = yawToward(dx, dz) - boat.yaw;
+  if (err > Math.PI) err -= TAU;
+  else if (err < -Math.PI) err += TAU;
+  if (dist < ARRIVE && Math.abs(err) < 0.6) {
+    boat.x = boat.tx;
+    boat.z = boat.tz;
+    boat.hasTarget = 0;
+    return 0;
+  }
+  const maxTurn = TURN_RATE * dt;
+  boat.yaw += Math.max(-maxTurn, Math.min(maxTurn, err));
+  if (boat.yaw > Math.PI) boat.yaw -= TAU;
+  else if (boat.yaw < -Math.PI) boat.yaw += TAU;
+  headingXZ(boat.yaw, stepHdg);
+  const align = stepHdg.fx * windX + stepHdg.fz * windZ;
+  let speed = 6.4 * (0.34 + 0.66 * (align * 0.5 + 0.5));
+  if (Math.abs(err) > 0.9 && dist < 18) speed = 0;
+  else speed = Math.min(speed, Math.max(1.1, dist * TURN_RATE * 0.9));
+  speed *= Math.min(1, dist / 8);
+  const step = Math.min(speed * dt, dist);
+  boat.x += stepHdg.fx * step;
+  boat.z += stepHdg.fz * step;
+  return speed;
+}
+
+function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+function cross(a, b) {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+function lerp(a, b, t) {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+const WHITE = [0.80, 0.78, 0.74];
+const RED = [0.40, 0.055, 0.045];
+const DECK = [0.46, 0.31, 0.18];
+const WOOD = [0.36, 0.24, 0.14];
+const SAIL = [0.90, 0.88, 0.80];
+const DARK = [0.07, 0.075, 0.08];
+const WINDOW = [0.12, 0.16, 0.20];
+const MARKER = [1.0, 0.52, 0.16];
+
+// color.w: 0 hull, 1+billow sail, 3 water marker.
+function buildSailboat() {
+  const data = [];
+  const indices = [];
+  const tags = [];
+  let bowTip = null;
+
+  function emit(p, n, color, billow) {
+    const i = data.length / 10;
+    data.push(p[0], p[1], p[2], n[0], n[1], n[2], color[0], color[1], color[2], billow);
+    return i;
+  }
+  function addTri(a, b, c, color, ba, bb, bc, hint, tag) {
+    const ab = sub(b, a), ac = sub(c, a);
+    let n = cross(ab, ac);
+    const len = Math.hypot(n[0], n[1], n[2]);
+    if (len < 1e-8) return;
+    n = [n[0] / len, n[1] / len, n[2] / len];
+    let pa = a, pb = b, pc = c, wA = ba, wB = bb, wC = bc;
+    if (n[0] * hint[0] + n[1] * hint[1] + n[2] * hint[2] < 0) {
+      pb = c; pc = b; wB = bc; wC = bb;
+      n = [-n[0], -n[1], -n[2]];
+    }
+    const ia = emit(pa, n, color, wA);
+    emit(pb, n, color, wB);
+    emit(pc, n, color, wC);
+    indices.push(ia, ia + 1, ia + 2);
+    if (tag) tags.push({ tag, n });
+  }
+  function addQuad(a, b, c, d, color, billow, hint, tag) {
+    addTri(a, b, c, color, billow, billow, billow, hint, tag);
+    addTri(a, c, d, color, billow, billow, billow, hint, null);
+  }
+  function addBox(cx, cy, cz, hx, hy, hz, color) {
+    const p = (x, y, z) => [cx + x * hx, cy + y * hy, cz + z * hz];
+    addQuad(p(1, -1, 1), p(1, -1, -1), p(1, 1, -1), p(1, 1, 1), color, 0, [1, 0, 0]);
+    addQuad(p(-1, -1, -1), p(-1, -1, 1), p(-1, 1, 1), p(-1, 1, -1), color, 0, [-1, 0, 0]);
+    addQuad(p(-1, 1, -1), p(1, 1, -1), p(1, 1, 1), p(-1, 1, 1), color, 0, [0, 1, 0]);
+    addQuad(p(-1, -1, 1), p(1, -1, 1), p(1, -1, -1), p(-1, -1, -1), color, 0, [0, -1, 0]);
+    addQuad(p(-1, -1, 1), p(-1, 1, 1), p(1, 1, 1), p(1, -1, 1), color, 0, [0, 0, 1]);
+    addQuad(p(1, -1, -1), p(1, 1, -1), p(-1, 1, -1), p(-1, -1, -1), color, 0, [0, 0, -1]);
+  }
+
+  // z is bow-negative. Each ring is keel, up the starboard side, across the deck, down port.
+  function ring(z, beam, keel, deck) {
+    return [
+      [0, keel, z],
+      [beam * 0.40, keel * 0.42, z],
+      [beam * 0.88, -0.18, z],
+      [beam, -0.02, z],
+      [beam * 0.96, 0.22, z],
+      [beam * 0.82, deck * 0.72, z],
+      [beam * 0.70, deck, z],
+      [0, deck + 0.025, z],
+      [-beam * 0.70, deck, z],
+      [-beam * 0.82, deck * 0.72, z],
+      [-beam * 0.96, 0.22, z],
+      [-beam, -0.02, z],
+      [-beam * 0.88, -0.18, z],
+      [-beam * 0.40, keel * 0.42, z],
+    ];
+  }
+  const stations = [
+    [-4.15, 0.28, -0.16, 0.42],
+    [-3.15, 0.78, -0.55, 0.64],
+    [-1.70, 1.18, -0.88, 0.74],
+    [-0.10, 1.30, -0.96, 0.76],
+    [1.55, 1.26, -0.84, 0.72],
+    [3.05, 1.05, -0.48, 0.62],
+    [4.15, 0.84, -0.12, 0.54],
+  ];
+  const rings = stations.map((s) => ring(s[0], s[1], s[2], s[3]));
+  const edgeColor = (i) => (i <= 2 || i >= 11 ? RED : (i >= 6 && i <= 8 ? DECK : WHITE));
+  const edgeHint = (p, q) => {
+    const x = (p[0] + q[0]) * 0.5;
+    const y = (p[1] + q[1]) * 0.5;
+    if (y > 0.45 && Math.abs(x) < 0.7) return [x * 0.15, 1, 0];
+    if (y < -0.2) return [x, -0.85, 0];
+    return [Math.sign(x || 1), 0.2, 0];
+  };
+
+  for (let s = 0; s < rings.length - 1; s++) {
+    const A = rings[s], B = rings[s + 1];
+    const n = A.length;
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      let tag = null;
+      if (s === 3 && i === 4) tag = 'starboard';
+      if (s === 3 && i === 6) tag = 'deck';
+      if (s === 3 && i === 0) tag = 'bottom';
+      addQuad(A[i], B[i], B[j], A[j], edgeColor(i), 0, edgeHint(A[i], A[j]), tag);
+    }
+  }
+
+  bowTip = [0, 0.32, -4.72];
+  for (let i = 0; i < rings[0].length; i++) {
+    const j = (i + 1) % rings[0].length;
+    const h = edgeHint(rings[0][i], rings[0][j]);
+    h[2] -= 1.2;
+    // i === 7 is the deck centerline, so this cap faces out the bow rather than off to one side.
+    addTri(bowTip, rings[0][j], rings[0][i], edgeColor(i), 0, 0, 0, h, i === 7 ? 'bow' : null);
+  }
+  const stern = rings[rings.length - 1];
+  const sternC = [0, 0.22, 4.42];
+  for (let i = 0; i < stern.length; i++) {
+    const j = (i + 1) % stern.length;
+    const h = edgeHint(stern[i], stern[j]);
+    h[2] += 1.2;
+    addTri(sternC, stern[i], stern[j], i > 2 && i < 11 ? WHITE : RED, 0, 0, 0, h, i === 7 ? 'transom' : null);
+  }
+
+  // Cabin, spars, keel, rudder. Sizes are half-extents.
+  addBox(0, 1.08, 0.85, 0.40, 0.30, 0.78, WOOD);
+  addBox(0.415, 1.12, 0.70, 0.012, 0.10, 0.26, WINDOW);
+  addBox(-0.415, 1.12, 0.70, 0.012, 0.10, 0.26, WINDOW);
+  addBox(0, 4.45, -0.40, 0.045, 3.72, 0.055, WOOD);          // mast, foot on the cabin
+  addBox(0.08, 1.18, 1.05, 0.03, 0.028, 1.55, WOOD);         // boom, aft of the mast
+  addBox(0, -1.28, 0.15, 0.04, 0.42, 0.62, DARK);            // keel fin
+  addBox(0, -1.68, 0.20, 0.11, 0.09, 0.36, DARK);            // bulb
+  addBox(0, -0.28, 4.05, 0.025, 0.48, 0.16, DARK);           // rudder
+
+  function addSail(head, tack, clew, cols, rows) {
+    const grid = [];
+    for (let r = 0; r <= rows; r++) {
+      const t = r / rows;
+      const luff = lerp(tack, head, t);
+      const leach = lerp(clew, head, t);
+      const row = [];
+      for (let c = 0; c <= cols; c++) {
+        const s = c / cols;
+        const p = lerp(luff, leach, s);
+        const camber = Math.sin(s * Math.PI) * (0.28 + 0.22 * (1 - t));
+        p[0] += camber;
+        row.push({ p, w: 1 + Math.sin(s * Math.PI) });
+      }
+      grid.push(row);
+    }
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const a = grid[r][c], b = grid[r][c + 1], d = grid[r + 1][c], e = grid[r + 1][c + 1];
+        const hint = [1, 0.15, 0];
+        addTri(a.p, b.p, e.p, SAIL, a.w, b.w, e.w, hint, null);
+        addTri(a.p, e.p, d.p, SAIL, a.w, e.w, d.w, hint, null);
+      }
+    }
+  }
+  addSail([0, 7.85, -0.40], [0, 1.28, -0.40], [0.12, 1.22, 2.55], 4, 7); // main
+  addSail([0, 6.3, -0.40], [0, 0.78, -4.35], [0.08, 1.05, -1.15], 3, 6);  // jib
+
+  const boatCount = indices.length;
+
+  // Waypoint ring in unit XZ. The shader scales it and plants it on the waves.
+  const seg = 40;
+  const inner = 0.58;
+  const base = data.length / 10;
+  for (let i = 0; i <= seg; i++) {
+    const a = (i / seg) * TAU;
+    const c = Math.cos(a), s = Math.sin(a);
+    emit([c * inner, 0, s * inner], [0, 1, 0], MARKER, 3);
+    emit([c, 0, s], [0, 1, 0], MARKER, 3);
+  }
+  const markerStart = indices.length;
+  for (let i = 0; i < seg; i++) {
+    const v = base + i * 2;
+    // CCW from above (+Y)
+    indices.push(v, v + 2, v + 1);
+    indices.push(v + 1, v + 2, v + 3);
+  }
+  // Normal of the first ring triangle, built the same way as the indices above.
+  const i0 = base;
+  const p0 = [data[i0 * 10], data[i0 * 10 + 1], data[i0 * 10 + 2]];
+  const p1 = [data[(i0 + 1) * 10], data[(i0 + 1) * 10 + 1], data[(i0 + 1) * 10 + 2]];
+  const p2 = [data[(i0 + 2) * 10], data[(i0 + 2) * 10 + 1], data[(i0 + 2) * 10 + 2]];
+  // indices are v, v+2, v+1 so the triangle is p0, p2, p1
+  const mn = cross(sub(p2, p0), sub(p1, p0));
+  tags.push({ tag: 'marker', n: mn });
+
+  if (indices.length > 65535) throw new Error('sailboat index overflow');
+  return {
+    vertices: new Float32Array(data),
+    indices: new Uint16Array(indices),
+    boatCount,
+    markerStart,
+    markerCount: indices.length - markerStart,
+    tags,
+    bowTip,
+  };
+}
+
+function selfTestBoat() {
+  const fail = (m) => { throw new Error('boat self-test: ' + m); };
+  const axes = { fx: 0, fy: 0, fz: 0, rx: 0, ry: 0, rz: 0, ux: 0, uy: 0, uz: 0 };
+  cameraAxes(0, 0, axes);
+  if (Math.abs(axes.fz + 1) > 1e-6 || Math.abs(axes.rx - 1) > 1e-6 || Math.abs(axes.uy - 1) > 1e-6) {
+    fail('yaw 0 camera basis');
+  }
+  const o = new Float32Array(9);
+  boatAxes(0, 0, 0, o);
+  if (Math.abs(o[0] - 1) > 1e-6 || Math.abs(o[4] - 1) > 1e-6 || Math.abs(o[8] - 1) > 1e-6) fail('identity boat axes');
+  boatAxes(0, 0.25, 0, o);
+  const bowY = -4 * o[7];
+  if (!(bowY > 0.5)) fail('positive pitch should raise the bow, got ' + bowY);
+  boatAxes(0, 0, 0.3, o);
+  if (!(o[1] > 0.1)) fail('positive roll should raise starboard');
+  boatAxes(Math.PI / 2, 0, 0, o);
+  // bow world direction = -localZ = -o[6..8]. At yaw 90° that is +X.
+  if (!(-o[6] > 0.9 && Math.abs(o[8]) < 1e-5)) fail('yaw 90 bow should face +X');
+
+  const pose = { pitch: 0, roll: 0 };
+  seaPose(1, 0, 0, 0, 0, 0, 0, 6.8, 2.1, pose);
+  if (!(pose.pitch > 0)) fail('higher bow sample should pitch bow up');
+  seaPose(0, 0, 0, 1, 0, 0, 0, 6.8, 2.1, pose);
+  if (!(pose.roll > 0)) fail('higher starboard sample should roll starboard up');
+  seaPose(0, 0, 0, 0, 1, 0, 0, 6.8, 2.1, pose);
+  if (!(pose.roll < 0)) fail('wind toward starboard should heel onto starboard');
+  boatAxes(0, 0, pose.roll, o);
+  if (!(o[1] < 0)) fail('that heel should drop local +X');
+
+  const cam = { x: 0, y: 8, z: 0, yaw: 0, pitch: -0.4, fovY: 1 };
+  const hit = waterHit(cam, 0, 0, 1);
+  if (!hit || !(hit.z < -5) || Math.abs(hit.x) > 0.05) fail('center click should hit water ahead, got ' + JSON.stringify(hit));
+  const right = waterHit(cam, 0.6, 0, 1);
+  if (!right || !(right.x > 1)) fail('right-of-center click should land at +X');
+  cam.pitch = 0.4;
+  if (waterHit(cam, 0, 0, 1) !== null) fail('looking up should miss the water');
+
+  const boat = { x: 0, z: 0, yaw: 0, hasTarget: 1, tx: 0, tz: -80 };
+  for (let i = 0; i < 90; i++) stepBoat(boat, 1 / 30, 0, -1);
+  if (!(boat.z < -8) || Math.abs(boat.x) > 1.5) fail('downwind run should move toward -Z, at ' + boat.x + ',' + boat.z);
+  const behind = { x: 0, z: 0 };
+  chasePosition(0, 0, 0, 0, 10, behind);
+  if (Math.abs(behind.x) > 1e-6 || Math.abs(behind.z - 10) > 1e-6) fail('orbit 0 should sit astern, on +Z');
+  chasePosition(0, 0, 0, 0.7, 10, behind);
+  if (!(behind.x > 2)) fail('positive orbit should move the camera to +X');
+  const look = { yaw: 0, pitch: 0 };
+  lookYawPitch(-behind.x, 0, -behind.z, look);
+  cameraAxes(look.yaw, look.pitch, axes);
+  const lookLen = Math.hypot(-behind.x, -behind.z);
+  if (Math.abs(axes.fx - (-behind.x / lookLen)) > 1e-5 || Math.abs(axes.fz - (-behind.z / lookLen)) > 1e-5) {
+    fail('chase look should point at the boat');
+  }
+  lookYawPitch(0, -2, -10, look);
+  if (!(look.yaw === 0 && look.pitch < 0)) fail('looking down -Z should be yaw 0 and a negative pitch');
+
+  const boat2 = { x: 0, z: 0, yaw: 0, hasTarget: 1, tx: 60, tz: 0 };
+  for (let i = 0; i < 600; i++) stepBoat(boat2, 1 / 30, 1, 0);
+  const left = Math.hypot(boat2.tx - boat2.x, boat2.tz - boat2.z);
+  if (left > 3) fail('should arrive at a beam target, remaining ' + left.toFixed(2));
+  if (boat2.hasTarget) fail('arrival should clear the waypoint');
+
+  const mesh = buildSailboat();
+  const tag = (name) => mesh.tags.find((t) => t.tag === name);
+  const star = tag('starboard'), deck = tag('deck'), bottom = tag('bottom'), bow = tag('bow'), transom = tag('transom'), marker = tag('marker');
+  if (!star || !(star.n[0] > 0.4)) fail('starboard face should point +X ' + (star && star.n));
+  if (!deck || !(deck.n[1] > 0.5)) fail('deck should point up ' + (deck && deck.n));
+  if (!bottom || !(bottom.n[1] < -0.2)) fail('bottom should point down ' + (bottom && bottom.n));
+  if (!bow || !(bow.n[2] < -0.2)) fail('bow cap should point -Z ' + (bow && bow.n));
+  if (!transom || !(transom.n[2] > 0.2)) fail('transom should point +Z ' + (transom && transom.n));
+  if (!marker || !(marker.n[1] > 0)) fail('marker ring should face up');
+  if (!(mesh.bowTip[2] < -4)) fail('bow tip');
+  if (mesh.boatCount < 100 || mesh.markerCount < 6) fail('mesh is empty');
+}
+
 // ---- js/main.js ----
 // WebGPU ocean — custom renderer.
-// FFT ocean (5 cascades) + CDLOD surface mesh + physically based sky + HDR post.
+// FFT ocean (6 cascades) + CDLOD surface mesh + physically based sky + HDR post,
+// plus one sailboat you steer by clicking the water.
 // All per-frame data lives in preallocated typed arrays / descriptors (no per-frame garbage
 // apart from the unavoidable swap-chain view and command buffer objects).
+
+
 
 
 
@@ -1616,6 +2171,7 @@ function mat4Mul(out, a, b) {
 }
 
 async function main() {
+  selfTestBoat();
   if (!navigator.gpu) fail('WebGPU is not available in this browser.');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
@@ -1797,9 +2353,9 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
+  const [oceanMod, skyMod, downMod, upMod, compMod, objMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
-    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'), shader(OBJECTS, 'boat'),
   ]);
   const oceanPipe = await device.createRenderPipelineAsync({
     label: 'ocean', layout: 'auto',
@@ -1843,6 +2399,57 @@ async function main() {
     fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
     fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+
+  // Sailboat. Drawn in the forward pass after the water and before the sky, so it
+  // occludes the sky and the water occludes the underwater hull. Basis comes from boatAxes.
+  const objPipe = await device.createRenderPipelineAsync({
+    label: 'boat', layout: 'auto',
+    vertex: {
+      module: objMod, entryPoint: 'vs',
+      buffers: [{
+        arrayStride: 40,
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x3' },
+          { shaderLocation: 1, offset: 12, format: 'float32x3' },
+          { shaderLocation: 2, offset: 24, format: 'float32x4' },
+        ],
+      }],
+    },
+    fragment: { module: objMod, entryPoint: 'fs', targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  });
+  const sail = buildSailboat();
+  const boatVB = mkBuf(sail.vertices.byteLength, GU.VERTEX | GU.COPY_DST, 'boat vb');
+  // writeBuffer requires a multiple of 4 bytes; the index list is an odd number of uint16s.
+  const ibBytes = (sail.indices.byteLength + 3) & ~3;
+  const boatIB = mkBuf(ibBytes, GU.INDEX | GU.COPY_DST, 'boat ib');
+  const ibPacked = new Uint8Array(ibBytes);
+  ibPacked.set(new Uint8Array(sail.indices.buffer, sail.indices.byteOffset, sail.indices.byteLength));
+  device.queue.writeBuffer(boatVB, 0, sail.vertices);
+  device.queue.writeBuffer(boatIB, 0, ibPacked);
+  const objUBO = mkBuf(80, GU.UNIFORM | GU.COPY_DST, 'boat ubo');
+  const objF = new Float32Array(20);
+  const boatAxesF = new Float32Array(9);
+  const bgObj = bg(objPipe, [{ buffer: frameUBO }, transView, envCubeView, sampClamp,
+    fullArr(dispTex), samplerSim, { buffer: objUBO }], 'boat');
+  const boatProbePipe = await computePipe(BOAT_PROBE, 'boat probe');
+  const probeInUBO = mkBuf(80, GU.UNIFORM | GU.COPY_DST, 'boat probe in');
+  const probeInF = new Float32Array(20);
+  const boatProbeOut = mkBuf(32, GU.STORAGE | GU.COPY_SRC, 'boat probe out');
+  const boatProbeRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'boat probe read');
+  const bgBoatProbe = bg(boatProbePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim,
+    { buffer: probeInUBO }, { buffer: boatProbeOut }], 'boatprobe');
+  const boatH = new Float32Array(5);
+  let boatProbePending = false;
+  const onBoatProbe = () => {
+    const src = new Float32Array(boatProbeRead.getMappedRange(0, 32));
+    for (let i = 0; i < 5; i++) boatH[i] = src[i];
+    boatProbeRead.unmap();
+    boatProbePending = false;
+  };
+  const onBoatProbeFail = () => { boatProbePending = false; };
 
   // Water height under the camera (async readback, a few frames of latency) so the
   // floating camera rides above passing crests instead of clipping into them.
@@ -2000,40 +2607,80 @@ async function main() {
     cam.x = v[0]; cam.y = v[1]; cam.z = v[2]; cam.yaw = (v[3] || 0) * D2R; cam.pitch = (v[4] || 0) * D2R;
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
+  // Ahead of the opening view and broadside to it, so the sails read instead of an end-on mast.
+  const boat = { x: 5, z: -18, yaw: 1.15, pitch: 0, roll: 0, y: 0, hasTarget: 0, tx: 0, tz: 0 };
+  if (qs.get('boat')) {
+    const v = qs.get('boat').split(',').map(Number);
+    boat.x = v[0]; boat.z = v[1]; if (Number.isFinite(v[2])) boat.yaw = v[2] * D2R;
+  }
+  if (qs.get('goto')) {
+    const v = qs.get('goto').split(',').map(Number);
+    boat.tx = v[0]; boat.tz = v[1]; boat.hasTarget = 1;
+  }
+  const wind = { x: 1, z: 0 };
+  const hdg = { fx: 0, fz: 0, rx: 0, rz: 0 };
+  const pose = { pitch: 0, roll: 0 };
+  const viewAxes = { fx: 0, fy: 0, fz: 0, rx: 0, ry: 0, rz: 0, ux: 0, uy: 0, uz: 0 };
+  const boatHud = document.getElementById('boat');
+  function setBoatHud() {
+    if (!boatHud) return;
+    if (!boat.hasTarget) { boatHud.textContent = 'click the water to sail'; return; }
+    const d = Math.hypot(boat.tx - boat.x, boat.tz - boat.z);
+    boatHud.textContent = `sailing  ${d.toFixed(0)} m`;
+  }
+  setBoatHud();
+  // orbit 0 keeps the camera astern. Positive orbit swings it to the camera's right.
+  const chase = { orbit: 0, distance: 16, placed: false };
+  const chaseAt = { x: 0, z: 0 };
   const keys = Object.create(null);
-  addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
+  addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'KeyH') togglePanel();
+    if (e.code.startsWith('Arrow')) e.preventDefault();
+  });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
-  let dragging = false;
-  canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
-  addEventListener('mouseup', () => { dragging = false; });
-  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-  addEventListener('mousemove', (e) => {
-    if (document.pointerLockElement === canvas || dragging) {
-      cam.yaw += e.movementX * 0.0022;
-      cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
-    }
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || W < 1 || H < 1) return;
+    const rect = canvas.getBoundingClientRect();
+    const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+    const hit = waterHit(cam, ndcX, ndcY, W / H);
+    if (!hit) return;
+    boat.tx = hit.x;
+    boat.tz = hit.z;
+    boat.hasTarget = 1;
+    setBoatHud();
   });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   addEventListener('wheel', (e) => {
-    cam.speed = Math.max(0.5, Math.min(400, cam.speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    // Scroll up narrows the field of view. Line and page deltas are scaled into pixels.
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 16;
+    else if (e.deltaMode === 2) dy *= 400;
+    cam.fovY = Math.min(100 * D2R, Math.max(12 * D2R, cam.fovY * Math.pow(1.08, dy / 100)));
   }, { passive: true });
 
   function updateCamera(dt) {
-    const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
-    let mx = 0, my = 0, mz = 0;
-    const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
-    const str = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
-    const up = (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ || keys.KeyC ? 1 : 0);
-    mx += fwd * cp * sy + str * cy;
-    my += fwd * sp + up;
-    mz += -fwd * cp * cy + str * sy;
-    const boost = keys.ShiftLeft || keys.ShiftRight ? 5 : 1;
-    const v = cam.speed * boost * dt;
-    cam.x += mx * v; cam.y += my * v; cam.z += mz * v;
-    cam.y = Math.max(1.0, Math.min(3000, cam.y));
-    // keep clear of the actual (displaced) water surface under the camera
+    const boost = keys.ShiftLeft || keys.ShiftRight ? 3 : 1;
+    if (keys.ArrowLeft) chase.orbit -= 0.9 * boost * dt;
+    if (keys.ArrowRight) chase.orbit += 0.9 * boost * dt;
+    if (keys.ArrowUp) chase.distance = Math.max(5, chase.distance - 12 * boost * dt);
+    if (keys.ArrowDown) chase.distance = Math.min(70, chase.distance + 12 * boost * dt);
+    chasePosition(boat.x, boat.z, boat.yaw, chase.orbit, chase.distance, chaseAt);
+    const camHeight = boat.y + 2.2 + chase.distance * 0.24;
+    if (!chase.placed) {
+      cam.x = chaseAt.x; cam.z = chaseAt.z; cam.y = camHeight;
+      chase.placed = true;
+    } else {
+      const k = 1 - Math.exp(-3.4 * dt);
+      cam.x += (chaseAt.x - cam.x) * k;
+      cam.z += (chaseAt.z - cam.z) * k;
+      cam.y += (camHeight - cam.y) * k;
+    }
     if (cam.y < waterH + 0.9) cam.y += (waterH + 0.9 - cam.y) * Math.min(1, dt * 12);
+    // Aim after the position settles, so the boat stays centered while the rig eases.
+    lookYawPitch(boat.x - cam.x, (boat.y + 1.6) - cam.y, boat.z - cam.z, cam);
   }
 
   // --------------------------------------------------------------------------------------
@@ -2115,10 +2762,10 @@ async function main() {
     const near = 0.05;
     proj.fill(0);
     proj[0] = 1 / tanX; proj[5] = 1 / tanY; proj[11] = -1; proj[14] = near;
-    const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
-    const fx = cp * sy, fy = sp, fz = -cp * cy;            // forward
-    const rx = cy, ry = 0, rz = sy;                          // right
-    const ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx; // up = right x fwd
+    cameraAxes(cam.yaw, cam.pitch, viewAxes);
+    const fx = viewAxes.fx, fy = viewAxes.fy, fz = viewAxes.fz;
+    const rx = viewAxes.rx, ry = viewAxes.ry, rz = viewAxes.rz;
+    const ux = viewAxes.ux, uy = viewAxes.uy, uz = viewAxes.uz;
     view.fill(0);
     view[0] = rx; view[4] = ry; view[8] = rz;
     view[1] = ux; view[5] = uy; view[9] = uz;
@@ -2135,7 +2782,8 @@ async function main() {
     f[32] = Math.sin(sa) * Math.cos(se); f[33] = Math.sin(se); f[34] = -Math.cos(sa) * Math.cos(se); f[35] = 14.0;
     f[36] = W; f[37] = H; f[38] = 1 / W; f[39] = 1 / H;
     for (let c = 0; c < C; c++) { f[40 + c] = CASC_L[c]; f[48 + c] = 1 / CASC_L[c]; }
-    f[56] = Math.cos(P.windDir * D2R); f[57] = Math.sin(P.windDir * D2R); f[58] = P.windSpeed;
+    windVector(P.windDir, wind);
+    f[56] = wind.x; f[57] = wind.z; f[58] = P.windSpeed;
     f[64] = R0; f[65] = GRID; f[66] = FOAM_LEVEL_SIZE[0]; f[67] = FOAM_LEVEL_SIZE[1];
     f[68] = P.exposure; f[69] = P.bloom; f[70] = frameIndex; f[71] = DBG;
     f[72] = P.haze; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = P.veil; f[75] = 0.9;
@@ -2268,10 +2916,32 @@ async function main() {
       const fps = fpsN / fpsAcc;
       hudFps.textContent = `${fps.toFixed(0)} fps  ${(1000 / fps).toFixed(2)} ms` +
         (hasTS ? `  |  GPU ${gpuMs.toFixed(2)} ms` : '') + `  |  ${nodeCount} nodes  ${W}x${H}`;
+      setBoatHud();
       fpsAcc = 0; fpsN = 0; fpsT = 0;
     }
     if (fixedDt) dt = fixedDt;
+    windVector(P.windDir, wind);
+    stepBoat(boat, dt, wind.x, wind.z);
+    headingXZ(boat.yaw, hdg);
+    seaPose(boatH[1], boatH[2], boatH[3], boatH[4], wind.x, wind.z, boat.yaw, 6.8, 2.1, pose);
+    const kSea = Math.min(1, dt * 4);
+    boat.pitch += (Math.max(-0.4, Math.min(0.4, pose.pitch)) - boat.pitch) * kSea;
+    boat.roll += (Math.max(-0.45, Math.min(0.45, pose.roll)) - boat.roll) * kSea;
+    boat.y += (boatH[0] - boat.y) * Math.min(1, dt * 8);
     updateCamera(dt);
+    boatAxes(boat.yaw, boat.pitch, boat.roll, boatAxesF);
+    objF[0] = boatAxesF[0]; objF[1] = boatAxesF[1]; objF[2] = boatAxesF[2];
+    objF[4] = boatAxesF[3]; objF[5] = boatAxesF[4]; objF[6] = boatAxesF[5];
+    objF[8] = boatAxesF[6]; objF[9] = boatAxesF[7]; objF[10] = boatAxesF[8];
+    objF[12] = boat.x; objF[13] = boat.y; objF[14] = boat.z;
+    objF[16] = boat.tx; objF[17] = boat.tz; objF[18] = 2.4;
+    device.queue.writeBuffer(objUBO, 0, objF);
+    probeInF[0] = boat.x; probeInF[2] = boat.z;
+    probeInF[4] = boat.x + hdg.fx * 3.5; probeInF[6] = boat.z + hdg.fz * 3.5;
+    probeInF[8] = boat.x - hdg.fx * 3.3; probeInF[10] = boat.z - hdg.fz * 3.3;
+    probeInF[12] = boat.x - hdg.rx * 1.05; probeInF[14] = boat.z - hdg.rz * 1.05;
+    probeInF[16] = boat.x + hdg.rx * 1.05; probeInF[18] = boat.z + hdg.rz * 1.05;
+    device.queue.writeBuffer(probeInUBO, 0, probeInF);
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
     frameIndex++;
@@ -2307,6 +2977,9 @@ async function main() {
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
+    cp.setPipeline(boatProbePipe);
+    cp.setBindGroup(0, bgBoatProbe);
+    cp.dispatchWorkgroups(1);
     cp.setPipeline(skyViewPipe);
     cp.setBindGroup(0, bgSkyView);
     cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
@@ -2334,6 +3007,12 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    rp.setPipeline(objPipe);
+    rp.setBindGroup(0, bgObj);
+    rp.setVertexBuffer(0, boatVB);
+    rp.setIndexBuffer(boatIB, 'uint16');
+    rp.drawIndexed(sail.boatCount);
+    if (boat.hasTarget) rp.drawIndexed(sail.markerCount, 1, sail.markerStart);
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
@@ -2370,6 +3049,11 @@ async function main() {
       enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
       doProbe = true;
     }
+    let doBoatProbe = false;
+    if (!boatProbePending && (frameIndex & 1) === 0) {
+      enc.copyBufferToBuffer(boatProbeOut, 0, boatProbeRead, 0, 32);
+      doBoatProbe = true;
+    }
     let doTs = false;
     if (hasTS && !tsPending && (frameIndex & 7) === 0) {
       enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
@@ -2387,6 +3071,7 @@ async function main() {
     submitList[0] = enc.finish();
     device.queue.submit(submitList);
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
+    if (doBoatProbe) { boatProbePending = true; boatProbeRead.mapAsync(GPUMapMode.READ).then(onBoatProbe, onBoatProbeFail); }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256, true);
   }

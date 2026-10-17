@@ -1,6 +1,8 @@
-# web-ocean
+# Leeward
 
-A real-time ocean renderer written from scratch on WebGPU, with no engine or rendering library. It draws a sunset sea with simulated waves, whitecaps, sun glitter, and a physically based sky with clouds. You fly around it with a free camera.
+A castaway game on an open ocean. You start stranded on an island, build skills, collect rare finds, and sail to new islands as the world opens up.
+
+The sea is a real-time WebGPU renderer with no engine or rendering library: simulated waves, whitecaps, sun glitter, and a physically based sky. It comes from [web-ocean](https://github.com/Noniv/web-ocean) by Maksymilian Dendura. Leeward adds a sailboat you can send across the water and a camera that follows it. Islands and skills are next.
 
 ![Looking toward the sun from 2.4 m above the water](docs/front.jpg)
 
@@ -27,17 +29,16 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 
 | Input | Action |
 |---|---|
-| Click the canvas | Capture the mouse (Esc releases it). Holding the right mouse button also works. |
-| Mouse | Look around |
-| W A S D | Move |
-| Space or E / Q or C | Up / down |
-| Shift | 5x speed |
-| Mouse wheel | Change base speed |
+| Click the water | Sail the boat to that point |
+| Arrow left / right | Orbit the camera around the boat |
+| Arrow up / down | Move the camera closer / farther |
+| Shift | Orbit and dolly faster |
+| Mouse wheel | Zoom the camera (field of view) |
 | H | Settings panel: wind, swell, choppiness, turbidity, foam, sun, haze, clouds, exposure, bloom |
 
-The camera keeps itself above the displaced water surface, so waves never pass through it.
+The camera follows behind the boat and keeps itself above the displaced water surface, so waves never pass through it.
 
-URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `cam=x,y,z,yawDeg,pitchDeg` sets the camera, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`.
+URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`. The camera follows the boat, so a `cam=` position is overwritten on the first frame.
 
 ## How it works
 

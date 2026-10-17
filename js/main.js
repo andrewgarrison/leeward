@@ -1,5 +1,6 @@
 // WebGPU ocean — custom renderer.
-// FFT ocean (5 cascades) + CDLOD surface mesh + physically based sky + HDR post.
+// FFT ocean (6 cascades) + CDLOD surface mesh + physically based sky + HDR post,
+// plus one sailboat you steer by clicking the water.
 // All per-frame data lives in preallocated typed arrays / descriptors (no per-frame garbage
 // apart from the unavoidable swap-chain view and command buffer objects).
 import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
@@ -7,6 +8,8 @@ import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIP
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
 import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
+import { OBJECTS, BOAT_PROBE } from './wgsl/objects.js';
+import { buildSailboat, cameraAxes, headingXZ, boatAxes, seaPose, stepBoat, waterHit, windVector, chasePosition, lookYawPitch, selfTestBoat } from './boat.js';
 
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
@@ -64,6 +67,7 @@ function mat4Mul(out, a, b) {
 }
 
 async function main() {
+  selfTestBoat();
   if (!navigator.gpu) fail('WebGPU is not available in this browser.');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
@@ -245,9 +249,9 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
+  const [oceanMod, skyMod, downMod, upMod, compMod, objMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
-    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'), shader(OBJECTS, 'boat'),
   ]);
   const oceanPipe = await device.createRenderPipelineAsync({
     label: 'ocean', layout: 'auto',
@@ -291,6 +295,57 @@ async function main() {
     fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
     fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+
+  // Sailboat. Drawn in the forward pass after the water and before the sky, so it
+  // occludes the sky and the water occludes the underwater hull. Basis comes from boatAxes.
+  const objPipe = await device.createRenderPipelineAsync({
+    label: 'boat', layout: 'auto',
+    vertex: {
+      module: objMod, entryPoint: 'vs',
+      buffers: [{
+        arrayStride: 40,
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x3' },
+          { shaderLocation: 1, offset: 12, format: 'float32x3' },
+          { shaderLocation: 2, offset: 24, format: 'float32x4' },
+        ],
+      }],
+    },
+    fragment: { module: objMod, entryPoint: 'fs', targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  });
+  const sail = buildSailboat();
+  const boatVB = mkBuf(sail.vertices.byteLength, GU.VERTEX | GU.COPY_DST, 'boat vb');
+  // writeBuffer requires a multiple of 4 bytes; the index list is an odd number of uint16s.
+  const ibBytes = (sail.indices.byteLength + 3) & ~3;
+  const boatIB = mkBuf(ibBytes, GU.INDEX | GU.COPY_DST, 'boat ib');
+  const ibPacked = new Uint8Array(ibBytes);
+  ibPacked.set(new Uint8Array(sail.indices.buffer, sail.indices.byteOffset, sail.indices.byteLength));
+  device.queue.writeBuffer(boatVB, 0, sail.vertices);
+  device.queue.writeBuffer(boatIB, 0, ibPacked);
+  const objUBO = mkBuf(80, GU.UNIFORM | GU.COPY_DST, 'boat ubo');
+  const objF = new Float32Array(20);
+  const boatAxesF = new Float32Array(9);
+  const bgObj = bg(objPipe, [{ buffer: frameUBO }, transView, envCubeView, sampClamp,
+    fullArr(dispTex), samplerSim, { buffer: objUBO }], 'boat');
+  const boatProbePipe = await computePipe(BOAT_PROBE, 'boat probe');
+  const probeInUBO = mkBuf(80, GU.UNIFORM | GU.COPY_DST, 'boat probe in');
+  const probeInF = new Float32Array(20);
+  const boatProbeOut = mkBuf(32, GU.STORAGE | GU.COPY_SRC, 'boat probe out');
+  const boatProbeRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'boat probe read');
+  const bgBoatProbe = bg(boatProbePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim,
+    { buffer: probeInUBO }, { buffer: boatProbeOut }], 'boatprobe');
+  const boatH = new Float32Array(5);
+  let boatProbePending = false;
+  const onBoatProbe = () => {
+    const src = new Float32Array(boatProbeRead.getMappedRange(0, 32));
+    for (let i = 0; i < 5; i++) boatH[i] = src[i];
+    boatProbeRead.unmap();
+    boatProbePending = false;
+  };
+  const onBoatProbeFail = () => { boatProbePending = false; };
 
   // Water height under the camera (async readback, a few frames of latency) so the
   // floating camera rides above passing crests instead of clipping into them.
@@ -448,40 +503,80 @@ async function main() {
     cam.x = v[0]; cam.y = v[1]; cam.z = v[2]; cam.yaw = (v[3] || 0) * D2R; cam.pitch = (v[4] || 0) * D2R;
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
+  // Ahead of the opening view and broadside to it, so the sails read instead of an end-on mast.
+  const boat = { x: 5, z: -18, yaw: 1.15, pitch: 0, roll: 0, y: 0, hasTarget: 0, tx: 0, tz: 0 };
+  if (qs.get('boat')) {
+    const v = qs.get('boat').split(',').map(Number);
+    boat.x = v[0]; boat.z = v[1]; if (Number.isFinite(v[2])) boat.yaw = v[2] * D2R;
+  }
+  if (qs.get('goto')) {
+    const v = qs.get('goto').split(',').map(Number);
+    boat.tx = v[0]; boat.tz = v[1]; boat.hasTarget = 1;
+  }
+  const wind = { x: 1, z: 0 };
+  const hdg = { fx: 0, fz: 0, rx: 0, rz: 0 };
+  const pose = { pitch: 0, roll: 0 };
+  const viewAxes = { fx: 0, fy: 0, fz: 0, rx: 0, ry: 0, rz: 0, ux: 0, uy: 0, uz: 0 };
+  const boatHud = document.getElementById('boat');
+  function setBoatHud() {
+    if (!boatHud) return;
+    if (!boat.hasTarget) { boatHud.textContent = 'click the water to sail'; return; }
+    const d = Math.hypot(boat.tx - boat.x, boat.tz - boat.z);
+    boatHud.textContent = `sailing  ${d.toFixed(0)} m`;
+  }
+  setBoatHud();
+  // orbit 0 keeps the camera astern. Positive orbit swings it to the camera's right.
+  const chase = { orbit: 0, distance: 16, placed: false };
+  const chaseAt = { x: 0, z: 0 };
   const keys = Object.create(null);
-  addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
+  addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'KeyH') togglePanel();
+    if (e.code.startsWith('Arrow')) e.preventDefault();
+  });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
-  let dragging = false;
-  canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
-  addEventListener('mouseup', () => { dragging = false; });
-  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-  addEventListener('mousemove', (e) => {
-    if (document.pointerLockElement === canvas || dragging) {
-      cam.yaw += e.movementX * 0.0022;
-      cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
-    }
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || W < 1 || H < 1) return;
+    const rect = canvas.getBoundingClientRect();
+    const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+    const hit = waterHit(cam, ndcX, ndcY, W / H);
+    if (!hit) return;
+    boat.tx = hit.x;
+    boat.tz = hit.z;
+    boat.hasTarget = 1;
+    setBoatHud();
   });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   addEventListener('wheel', (e) => {
-    cam.speed = Math.max(0.5, Math.min(400, cam.speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    // Scroll up narrows the field of view. Line and page deltas are scaled into pixels.
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 16;
+    else if (e.deltaMode === 2) dy *= 400;
+    cam.fovY = Math.min(100 * D2R, Math.max(12 * D2R, cam.fovY * Math.pow(1.08, dy / 100)));
   }, { passive: true });
 
   function updateCamera(dt) {
-    const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
-    let mx = 0, my = 0, mz = 0;
-    const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
-    const str = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
-    const up = (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ || keys.KeyC ? 1 : 0);
-    mx += fwd * cp * sy + str * cy;
-    my += fwd * sp + up;
-    mz += -fwd * cp * cy + str * sy;
-    const boost = keys.ShiftLeft || keys.ShiftRight ? 5 : 1;
-    const v = cam.speed * boost * dt;
-    cam.x += mx * v; cam.y += my * v; cam.z += mz * v;
-    cam.y = Math.max(1.0, Math.min(3000, cam.y));
-    // keep clear of the actual (displaced) water surface under the camera
+    const boost = keys.ShiftLeft || keys.ShiftRight ? 3 : 1;
+    if (keys.ArrowLeft) chase.orbit -= 0.9 * boost * dt;
+    if (keys.ArrowRight) chase.orbit += 0.9 * boost * dt;
+    if (keys.ArrowUp) chase.distance = Math.max(5, chase.distance - 12 * boost * dt);
+    if (keys.ArrowDown) chase.distance = Math.min(70, chase.distance + 12 * boost * dt);
+    chasePosition(boat.x, boat.z, boat.yaw, chase.orbit, chase.distance, chaseAt);
+    const camHeight = boat.y + 2.2 + chase.distance * 0.24;
+    if (!chase.placed) {
+      cam.x = chaseAt.x; cam.z = chaseAt.z; cam.y = camHeight;
+      chase.placed = true;
+    } else {
+      const k = 1 - Math.exp(-3.4 * dt);
+      cam.x += (chaseAt.x - cam.x) * k;
+      cam.z += (chaseAt.z - cam.z) * k;
+      cam.y += (camHeight - cam.y) * k;
+    }
     if (cam.y < waterH + 0.9) cam.y += (waterH + 0.9 - cam.y) * Math.min(1, dt * 12);
+    // Aim after the position settles, so the boat stays centered while the rig eases.
+    lookYawPitch(boat.x - cam.x, (boat.y + 1.6) - cam.y, boat.z - cam.z, cam);
   }
 
   // --------------------------------------------------------------------------------------
@@ -563,10 +658,10 @@ async function main() {
     const near = 0.05;
     proj.fill(0);
     proj[0] = 1 / tanX; proj[5] = 1 / tanY; proj[11] = -1; proj[14] = near;
-    const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
-    const fx = cp * sy, fy = sp, fz = -cp * cy;            // forward
-    const rx = cy, ry = 0, rz = sy;                          // right
-    const ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx; // up = right x fwd
+    cameraAxes(cam.yaw, cam.pitch, viewAxes);
+    const fx = viewAxes.fx, fy = viewAxes.fy, fz = viewAxes.fz;
+    const rx = viewAxes.rx, ry = viewAxes.ry, rz = viewAxes.rz;
+    const ux = viewAxes.ux, uy = viewAxes.uy, uz = viewAxes.uz;
     view.fill(0);
     view[0] = rx; view[4] = ry; view[8] = rz;
     view[1] = ux; view[5] = uy; view[9] = uz;
@@ -583,7 +678,8 @@ async function main() {
     f[32] = Math.sin(sa) * Math.cos(se); f[33] = Math.sin(se); f[34] = -Math.cos(sa) * Math.cos(se); f[35] = 14.0;
     f[36] = W; f[37] = H; f[38] = 1 / W; f[39] = 1 / H;
     for (let c = 0; c < C; c++) { f[40 + c] = CASC_L[c]; f[48 + c] = 1 / CASC_L[c]; }
-    f[56] = Math.cos(P.windDir * D2R); f[57] = Math.sin(P.windDir * D2R); f[58] = P.windSpeed;
+    windVector(P.windDir, wind);
+    f[56] = wind.x; f[57] = wind.z; f[58] = P.windSpeed;
     f[64] = R0; f[65] = GRID; f[66] = FOAM_LEVEL_SIZE[0]; f[67] = FOAM_LEVEL_SIZE[1];
     f[68] = P.exposure; f[69] = P.bloom; f[70] = frameIndex; f[71] = DBG;
     f[72] = P.haze; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = P.veil; f[75] = 0.9;
@@ -716,10 +812,32 @@ async function main() {
       const fps = fpsN / fpsAcc;
       hudFps.textContent = `${fps.toFixed(0)} fps  ${(1000 / fps).toFixed(2)} ms` +
         (hasTS ? `  |  GPU ${gpuMs.toFixed(2)} ms` : '') + `  |  ${nodeCount} nodes  ${W}x${H}`;
+      setBoatHud();
       fpsAcc = 0; fpsN = 0; fpsT = 0;
     }
     if (fixedDt) dt = fixedDt;
+    windVector(P.windDir, wind);
+    stepBoat(boat, dt, wind.x, wind.z);
+    headingXZ(boat.yaw, hdg);
+    seaPose(boatH[1], boatH[2], boatH[3], boatH[4], wind.x, wind.z, boat.yaw, 6.8, 2.1, pose);
+    const kSea = Math.min(1, dt * 4);
+    boat.pitch += (Math.max(-0.4, Math.min(0.4, pose.pitch)) - boat.pitch) * kSea;
+    boat.roll += (Math.max(-0.45, Math.min(0.45, pose.roll)) - boat.roll) * kSea;
+    boat.y += (boatH[0] - boat.y) * Math.min(1, dt * 8);
     updateCamera(dt);
+    boatAxes(boat.yaw, boat.pitch, boat.roll, boatAxesF);
+    objF[0] = boatAxesF[0]; objF[1] = boatAxesF[1]; objF[2] = boatAxesF[2];
+    objF[4] = boatAxesF[3]; objF[5] = boatAxesF[4]; objF[6] = boatAxesF[5];
+    objF[8] = boatAxesF[6]; objF[9] = boatAxesF[7]; objF[10] = boatAxesF[8];
+    objF[12] = boat.x; objF[13] = boat.y; objF[14] = boat.z;
+    objF[16] = boat.tx; objF[17] = boat.tz; objF[18] = 2.4;
+    device.queue.writeBuffer(objUBO, 0, objF);
+    probeInF[0] = boat.x; probeInF[2] = boat.z;
+    probeInF[4] = boat.x + hdg.fx * 3.5; probeInF[6] = boat.z + hdg.fz * 3.5;
+    probeInF[8] = boat.x - hdg.fx * 3.3; probeInF[10] = boat.z - hdg.fz * 3.3;
+    probeInF[12] = boat.x - hdg.rx * 1.05; probeInF[14] = boat.z - hdg.rz * 1.05;
+    probeInF[16] = boat.x + hdg.rx * 1.05; probeInF[18] = boat.z + hdg.rz * 1.05;
+    device.queue.writeBuffer(probeInUBO, 0, probeInF);
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
     frameIndex++;
@@ -755,6 +873,9 @@ async function main() {
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
+    cp.setPipeline(boatProbePipe);
+    cp.setBindGroup(0, bgBoatProbe);
+    cp.dispatchWorkgroups(1);
     cp.setPipeline(skyViewPipe);
     cp.setBindGroup(0, bgSkyView);
     cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
@@ -782,6 +903,12 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    rp.setPipeline(objPipe);
+    rp.setBindGroup(0, bgObj);
+    rp.setVertexBuffer(0, boatVB);
+    rp.setIndexBuffer(boatIB, 'uint16');
+    rp.drawIndexed(sail.boatCount);
+    if (boat.hasTarget) rp.drawIndexed(sail.markerCount, 1, sail.markerStart);
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
@@ -818,6 +945,11 @@ async function main() {
       enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
       doProbe = true;
     }
+    let doBoatProbe = false;
+    if (!boatProbePending && (frameIndex & 1) === 0) {
+      enc.copyBufferToBuffer(boatProbeOut, 0, boatProbeRead, 0, 32);
+      doBoatProbe = true;
+    }
     let doTs = false;
     if (hasTS && !tsPending && (frameIndex & 7) === 0) {
       enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
@@ -835,6 +967,7 @@ async function main() {
     submitList[0] = enc.finish();
     device.queue.submit(submitList);
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
+    if (doBoatProbe) { boatProbePending = true; boatProbeRead.mapAsync(GPUMapMode.READ).then(onBoatProbe, onBoatProbeFail); }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256, true);
   }

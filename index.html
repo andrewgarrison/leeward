@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ocean — WebGPU</title>
+<title>Leeward</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
@@ -23,7 +23,8 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <div id="fps">starting…</div>
-  <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · H panel</div>
+  <div id="boat">click the water to sail</div>
+  <div class="help">click water: sail there · arrows orbit and dolly · shift faster · wheel zoom · H panel</div>
 </div>
 <div id="panel" class="hidden"></div>
 <div id="err"></div>

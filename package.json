@@ -1,7 +1,7 @@
 {
-  "name": "web-ocean",
+  "name": "leeward",
   "version": "1.0.0",
-  "description": "Real-time WebGPU ocean renderer: FFT waves, whitecaps, physically based sunset sky.",
+  "description": "Leeward: a castaway sailing game on a real-time WebGPU ocean.",
   "license": "MIT",
   "private": true,
   "type": "module",
