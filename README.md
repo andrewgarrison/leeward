@@ -14,16 +14,16 @@ The sea is a real-time WebGPU renderer with no engine or rendering library: simu
 
 You need a recent Chrome with WebGPU and a reasonably capable GPU. On a laptop, force Chrome onto the dedicated GPU in the Windows graphics settings, or it will fall back to the integrated one.
 
-Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (61 KB instead of 102 KB). Both are self-contained and work from `file://`.
-
-To run from source:
+Two pages live side by side while the client moves onto Vite and Three.js (see `docs/architecture/leeward-architecture.md`).
 
 ```
 npm install
-npm start        # serves http://localhost:8080/
+npm run ocean    # the sailing page, http://localhost:8080/  (`npm start` is the same)
+npm run dev      # the new client, http://localhost:5173/
+npm test
 ```
 
-After editing anything under `js/`, run `npm run build` to regenerate both bundles. The minified build strips WGSL comments and whitespace and minifies the JavaScript with esbuild.
+`npm run build` writes the Vite client to `dist/`. `npm run build:ocean` still regenerates `ocean.html` and `ocean.min.html` from `js/`. Open `ocean.html` directly in the browser when you want that page from disk.
 
 ## Controls
 

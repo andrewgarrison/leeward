@@ -46,8 +46,27 @@ export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ 
 @group(0) @binding(7) var foamTex: texture_2d<f32>;
 @group(0) @binding(8) var envCube: texture_cube<f32>;
 @group(0) @binding(9) var sampR: sampler;
+struct LandInfo {
+  map0: vec4f,   // xy origin (m), zw inv size (1/m)
+  map1: vec4f,
+  extra: vec4f,  // x = deep water height
+};
+
 @group(0) @binding(10) var foamWorld: texture_2d_array<f32>;
 @group(0) @binding(11) var<storage, read> sunVis: array<f32, 4>;
+@group(0) @binding(12) var land0: texture_2d<f32>;
+@group(0) @binding(13) var land1: texture_2d<f32>;
+@group(0) @binding(14) var sampL: sampler;
+@group(0) @binding(15) var<uniform> L: LandInfo;
+
+fn mapHeight(tex: texture_2d<f32>, p: vec2f, m: vec4f) -> f32 {
+  let uv = (p - m.xy) * m.zw;
+  if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0))) { return -1000.0; }
+  return textureSampleLevel(tex, sampL, uv, 0.0).r;
+}
+fn seabed(p: vec2f) -> f32 {
+  return max(L.extra.x, max(mapHeight(land0, p, L.map0), mapHeight(land1, p, L.map1)));
+}
 ` + SKY_RENDER_FUNCS + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 const ENV_TEXELS_PER_RAD: f32 = ${ENV_SIZE}.0 / 1.5708;
@@ -114,6 +133,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
 
 @fragment fn fs(in: VSOut) -> @location(0) vec4f {
   let xz = in.xz;
+  // World position of this water sample, after chop has shoved the surface sideways.
+  let bed = seabed(in.rel.xz + F.camPos.xz);
+  let depth = max(in.height - bed, 0.0);
+  if (bed > in.height + 0.18) { discard; }
   var s = vec2f(0.0);
   var jxx = 0.0;
   var jzz = 0.0;
@@ -236,6 +259,20 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   var foamMask = clamp(fm * smoothstep(0.0, 0.5, cover), 0.0, 1.0) * (0.68 + 0.32 * smoothstep(0.3, 0.9, cover));
   // freshly broken crests: dense, almost opaque core
   foamMask = max(foamMask, smoothstep(0.35, 0.9, fwl.g) * smoothstep(0.25, 0.6, pat + 0.25) * 0.95);
+  // Shallows. A few metres of water shifts toward tropical green. Sand shows only
+  // in the last metre, and only through the part of the surface that is not reflecting sky.
+  let near = smoothstep(-12.0, -2.0, bed);
+  if (near > 0.001) {
+    let trop = vec3f(0.03, 0.16, 0.14) * (skyHemi * 1.15 + sunE * max(Ld.y, 0.0) * 0.35);
+    let mid = (1.0 - smoothstep(2.2, 7.5, depth)) * near;
+    body = mix(body, mix(body, trop, 0.65), mid * (1.0 - Fr * 0.45));
+    let sand = vec3f(0.46, 0.39, 0.27);
+    let lit = sand * (skyHemi * 1.2 + sunE * max(Ld.y, 0.0) * 0.4);
+    let k = (1.0 - smoothstep(0.2, 1.6, depth)) * smoothstep(-4.0, -0.3, bed);
+    body = mix(body, lit, k * 0.8 * (1.0 - Fr));
+    let wash = (1.0 - smoothstep(0.05, 0.9, depth)) * smoothstep(-0.5, 0.25, bed);
+    foamMask = max(foamMask, wash * 0.4 * (0.35 + 0.65 * pat));
+  }
   // submerged bubbles brighten and tint the water just beneath foam
   body += F.sssCol.rgb * (sunE * 0.05 + ambient * 0.35) * clamp(cover, 0.0, 1.0);
   body += vec3f(0.10, 0.32, 0.30) * skyUp * fwl.g * 0.35;

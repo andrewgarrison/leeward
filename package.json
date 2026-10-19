@@ -7,9 +7,20 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "build": "node build.mjs"
+    "ocean": "node server.mjs",
+    "dev": "vite",
+    "build": "vite build",
+    "build:ocean": "node build.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "three": "0.186.0"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "@types/three": "^0.186.0",
+    "esbuild": "^0.25.0",
+    "typescript": "5.9.3",
+    "vite": "7.1.10",
+    "vitest": "3.2.4"
   }
 }

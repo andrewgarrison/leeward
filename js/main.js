@@ -1,6 +1,6 @@
 // WebGPU ocean — custom renderer.
 // FFT ocean (6 cascades) + CDLOD surface mesh + physically based sky + HDR post,
-// plus one sailboat you steer by clicking the water.
+// plus one sailboat you steer by clicking the water, and the island of First Light.
 // All per-frame data lives in preallocated typed arrays / descriptors (no per-frame garbage
 // apart from the unavoidable swap-chain view and command buffer objects).
 import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
@@ -10,6 +10,8 @@ import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 import { OBJECTS, BOAT_PROBE } from './wgsl/objects.js';
 import { buildSailboat, cameraAxes, headingXZ, boatAxes, seaPose, stepBoat, waterHit, windVector, chasePosition, lookYawPitch, selfTestBoat } from './boat.js';
+import { TERRAIN } from './wgsl/terrain.js';
+import { ANCHOR, DEEP, buildLandMesh, fillLandMap, grounds, landMaps, offshorePoint, selfTestLand } from './land.js';
 
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
@@ -68,6 +70,7 @@ function mat4Mul(out, a, b) {
 
 async function main() {
   selfTestBoat();
+  selfTestLand();
   if (!navigator.gpu) fail('WebGPU is not available in this browser.');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
@@ -249,9 +252,10 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod, objMod] = await Promise.all([
+  const [oceanMod, skyMod, downMod, upMod, compMod, objMod, terrainMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'), shader(OBJECTS, 'boat'),
+    shader(TERRAIN, 'terrain'),
   ]);
   const oceanPipe = await device.createRenderPipelineAsync({
     label: 'ocean', layout: 'auto',
@@ -291,10 +295,59 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
+  const maps = landMaps();
+  const landTex = maps.map((map) => {
+    const tex = device.createTexture({
+      label: 'land ' + map.name, size: [map.res, map.res], format: 'r16float',
+      usage: TU.TEXTURE_BINDING | TU.COPY_DST,
+    });
+    const pixels = fillLandMap(map);
+    device.queue.writeTexture(
+      { texture: tex }, pixels, { bytesPerRow: map.res * 2 }, { width: map.res, height: map.res },
+    );
+    return tex;
+  });
+  const landSamp = device.createSampler({
+    magFilter: 'linear', minFilter: 'linear',
+    addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
+  });
+  const landUBO = mkBuf(48, GU.UNIFORM | GU.COPY_DST, 'land ubo');
+  const landF = new Float32Array(12);
+  maps.forEach((map, i) => {
+    landF[i * 4] = map.x0; landF[i * 4 + 1] = map.z0;
+    landF[i * 4 + 2] = 1 / map.size; landF[i * 4 + 3] = 1 / map.size;
+  });
+  landF[8] = DEEP;
+  device.queue.writeBuffer(landUBO, 0, landF);
   const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
     fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
+    fullArr(foamW[i]), { buffer: sunVisBuf },
+    landTex[0].createView(), landTex[1].createView(), landSamp, { buffer: landUBO }], 'ocean' + i));
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+
+  const terrainPipe = await device.createRenderPipelineAsync({
+    label: 'terrain', layout: 'auto',
+    vertex: {
+      module: terrainMod, entryPoint: 'vs',
+      buffers: [{
+        arrayStride: 24,
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x3' },
+          { shaderLocation: 1, offset: 12, format: 'float32x3' },
+        ],
+      }],
+    },
+    fragment: { module: terrainMod, entryPoint: 'fs', targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'back' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  });
+  const landMesh = buildLandMesh();
+  const landVB = mkBuf(landMesh.vertices.byteLength, GU.VERTEX | GU.COPY_DST, 'land vb');
+  const landIB = mkBuf(landMesh.indices.byteLength, GU.INDEX | GU.COPY_DST, 'land ib');
+  device.queue.writeBuffer(landVB, 0, landMesh.vertices);
+  device.queue.writeBuffer(landIB, 0, landMesh.indices);
+  const bgTerrain = bg(terrainPipe, [{ buffer: frameUBO }, transView, envCubeView, sampClamp], 'terrain');
 
   // Sailboat. Drawn in the forward pass after the water and before the sky, so it
   // occludes the sky and the water occludes the underwater hull. Basis comes from boatAxes.
@@ -504,7 +557,7 @@ async function main() {
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   // Ahead of the opening view and broadside to it, so the sails read instead of an end-on mast.
-  const boat = { x: 5, z: -18, yaw: 1.15, pitch: 0, roll: 0, y: 0, hasTarget: 0, tx: 0, tz: 0 };
+  const boat = { x: ANCHOR.x, z: ANCHOR.z, yaw: ANCHOR.yaw, pitch: 0, roll: 0, y: 0, hasTarget: 0, tx: 0, tz: 0, held: 0 };
   if (qs.get('boat')) {
     const v = qs.get('boat').split(',').map(Number);
     boat.x = v[0]; boat.z = v[1]; if (Number.isFinite(v[2])) boat.yaw = v[2] * D2R;
@@ -520,6 +573,7 @@ async function main() {
   const boatHud = document.getElementById('boat');
   function setBoatHud() {
     if (!boatHud) return;
+    if (boat.held) { boatHud.textContent = 'the beach holds the boat'; return; }
     if (!boat.hasTarget) { boatHud.textContent = 'click the water to sail'; return; }
     const d = Math.hypot(boat.tx - boat.x, boat.tz - boat.z);
     boatHud.textContent = `sailing  ${d.toFixed(0)} m`;
@@ -527,6 +581,7 @@ async function main() {
   setBoatHud();
   // orbit 0 keeps the camera astern. Positive orbit swings it to the camera's right.
   const chase = { orbit: 0, distance: 16, placed: false };
+  if (qs.get('dist')) chase.distance = Math.max(5, Number(qs.get('dist')) || 16);
   const chaseAt = { x: 0, z: 0 };
   const keys = Object.create(null);
   addEventListener('keydown', (e) => {
@@ -543,9 +598,12 @@ async function main() {
     const ndcY = 1 - ((e.clientY - rect.top) / rect.height) * 2;
     const hit = waterHit(cam, ndcX, ndcY, W / H);
     if (!hit) return;
-    boat.tx = hit.x;
-    boat.tz = hit.z;
+    const spot = offshorePoint(hit.x, hit.z, boat.x, boat.z);
+    if (!spot) return;
+    boat.tx = spot.x;
+    boat.tz = spot.z;
     boat.hasTarget = 1;
+    boat.held = 0;
     setBoatHud();
   });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -817,8 +875,15 @@ async function main() {
     }
     if (fixedDt) dt = fixedDt;
     windVector(P.windDir, wind);
+    const prevX = boat.x, prevZ = boat.z;
     stepBoat(boat, dt, wind.x, wind.z);
     headingXZ(boat.yaw, hdg);
+    if (grounds(boat.x + hdg.fx * 4.2, boat.z + hdg.fz * 4.2) || grounds(boat.x, boat.z)) {
+      boat.x = prevX;
+      boat.z = prevZ;
+      boat.hasTarget = 0;
+      boat.held = 1;
+    }
     seaPose(boatH[1], boatH[2], boatH[3], boatH[4], wind.x, wind.z, boat.yaw, 6.8, 2.1, pose);
     const kSea = Math.min(1, dt * 4);
     boat.pitch += (Math.max(-0.4, Math.min(0.4, pose.pitch)) - boat.pitch) * kSea;
@@ -896,6 +961,11 @@ async function main() {
     cp.end();
 
     const rp = enc.beginRenderPass(mainPass);
+    rp.setPipeline(terrainPipe);
+    rp.setBindGroup(0, bgTerrain);
+    rp.setVertexBuffer(0, landVB);
+    rp.setIndexBuffer(landIB, 'uint32');
+    rp.drawIndexed(landMesh.indexCount);
     if (nodeCount) {
       rp.setPipeline(oceanPipe);
       rp.setBindGroup(0, bgOcean[foamCur]);

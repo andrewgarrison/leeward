@@ -1,4 +1,5 @@
 node_modules/
+dist/
 # local screenshot captures written by server.mjs (/__shot) and test shots
 shots/
 # local tooling
